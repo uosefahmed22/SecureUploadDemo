@@ -1,50 +1,131 @@
-# Secure File Upload Demo (.NET 10)
+using Microsoft.Extensions.Options;
+using SecureUploadDemo.Settings;
 
-A production-ready ASP.NET Core Web API demonstrating a secure file upload pipeline. The project uses Cloudinary as a cloud storage provider to ensure uploaded files never touch the local application server's file system.
+namespace SecureUploadDemo.Helpers;
 
-## Security Layers Implemented
-
-1. **File Size Validation**: Restricts uploads to a maximum file size (default: 5MB) to prevent Denial of Service (DoS) attacks.
-2. **Extension Whitelisting**: Validates file extensions against a set of allowed types (`.jpg`, `.jpeg`, `.png`, `.webp`).
-3. **Magic Bytes (File Signature) Verification**: Inspects the initial bytes of the file stream to verify its actual content type, preventing extension-spoofing attacks (e.g., renaming a `.php` shell to `.jpg`).
-4. **Safe Filename Generation**: Generates a unique GUID-based filename, completely discarding the original client-supplied filename to prevent Path Traversal attacks (e.g., payloads like `../../appsettings.json`).
-5. **Direct Cloud Upload**: Streams files directly to Cloudinary. Since files are not written to the local web server, there is no threat of local execution.
-
-## Getting Started
-
-### Prerequisites
-- [.NET 10 SDK](https://dotnet.microsoft.com/download)
-- A [Cloudinary Account](https://cloudinary.com) (free tier is sufficient)
-
-### Configuration
-Configure your Cloudinary credentials in `appsettings.json`:
-
-```json
+/// <summary>
+/// Handles all file validation checks (Security Layer)
+/// 
+/// Step 1: File Size Limit          → Prevent DoS attacks
+/// Step 2: Extension Validation     → First layer of defense
+/// Step 3: Magic Bytes Validation   → Verify actual file content
+/// Step 4: Generate Safe File Name  → Prevent Path Traversal
+/// </summary>
+public class FileValidator
 {
-  "CloudinarySettings": {
-    "CloudName": "YOUR_CLOUD_NAME",
-    "ApiKey": "YOUR_API_KEY",
-    "ApiSecret": "YOUR_API_SECRET"
-  },
-  "UploadSettings": {
-    "AllowedExtensions": [ ".jpg", ".jpeg", ".png", ".webp" ],
-    "MaxFileSizeInMB": 5
-  }
+    private readonly UploadSettings _uploadSettings;
+
+    // ============================================
+    // Magic Bytes (File Signatures)
+    // The first few bytes of a file that identify
+    // its actual type, regardless of extension
+    // ============================================
+    private static readonly Dictionary<string, byte[][]> _imageSignatures = new()
+    {
+        // JPEG: starts with FF D8 FF
+        {
+            ".jpg", new[]
+            {
+                new byte[] { 0xFF, 0xD8, 0xFF }
+            }
+        },
+        {
+            ".jpeg", new[]
+            {
+                new byte[] { 0xFF, 0xD8, 0xFF }
+            }
+        },
+        // PNG: starts with 89 50 4E 47
+        {
+            ".png", new[]
+            {
+                new byte[] { 0x89, 0x50, 0x4E, 0x47 }
+            }
+        },
+        // WebP: starts with 52 49 46 46 (RIFF)
+        {
+            ".webp", new[]
+            {
+                new byte[] { 0x52, 0x49, 0x46, 0x46 }
+            }
+        }
+    };
+
+    public FileValidator(IOptions<UploadSettings> uploadSettings)
+    {
+        _uploadSettings = uploadSettings.Value;
+    }
+
+    /// <summary>
+    /// Runs all validation checks on the uploaded file.
+    /// Returns (isValid, errorMessage)
+    /// </summary>
+    public (bool IsValid, string? ErrorMessage) Validate(IFormFile file)
+    {
+        // =============================================
+        // Step 1: Check File Size
+        // Prevent DoS — someone uploading a 2GB file
+        // =============================================
+        if (file.Length == 0)
+            return (false, "File is empty.");
+
+        if (file.Length > _uploadSettings.MaxFileSizeInBytes)
+            return (false, $"File size exceeds the maximum allowed size of {_uploadSettings.MaxFileSizeInMB}MB.");
+
+        // =============================================
+        // Step 2: Check File Extension
+        // First layer of defense (but NOT enough alone!)
+        // Someone could rename malware.php → image.jpg
+        // =============================================
+        var extension = Path.GetExtension(file.FileName)?.ToLowerInvariant();
+
+        if (string.IsNullOrEmpty(extension))
+            return (false, "File has no extension.");
+
+        if (!_uploadSettings.AllowedExtensions.Contains(extension))
+            return (false, $"Extension '{extension}' is not allowed. Allowed: {string.Join(", ", _uploadSettings.AllowedExtensions)}");
+
+        // =============================================
+        // Step 3: Check Magic Bytes (File Signature)
+        // Read the first bytes of the file to verify
+        // it's ACTUALLY an image, not just renamed
+        // =============================================
+        if (!IsValidMagicBytes(file, extension))
+            return (false, "File content does not match its extension. The file may be corrupted or tampered with.");
+
+        return (true, null);
+    }
+
+    /// <summary>
+    /// Step 4: Generate a safe filename using GUID.
+    /// Never use the original filename — prevents Path Traversal.
+    /// Example attack: "../../appsettings.json" as filename
+    /// </summary>
+    public static string GenerateSafeFileName(string extension)
+    {
+        return $"{Guid.NewGuid()}{extension}";
+    }
+
+    /// <summary>
+    /// Reads the first bytes of the file and compares them
+    /// against known image file signatures (Magic Bytes)
+    /// </summary>
+    private bool IsValidMagicBytes(IFormFile file, string extension)
+    {
+        if (!_imageSignatures.TryGetValue(extension, out var signatures))
+            return false;
+
+        using var reader = new BinaryReader(file.OpenReadStream());
+
+        // Read enough bytes to check the longest signature
+        var maxLength = signatures.Max(s => s.Length);
+        var headerBytes = reader.ReadBytes(maxLength);
+
+        if (headerBytes.Length < maxLength)
+            return false;
+
+        // Check if the file starts with any of the valid signatures
+        return signatures.Any(signature =>
+            headerBytes.Take(signature.Length).SequenceEqual(signature));
+    }
 }
-```
-
-### Running the Application
-
-Restore dependencies and run the API:
-
-```bash
-dotnet run
-```
-
-### Testing the Endpoint
-Make a `POST` request to `/api/upload/profile-picture` using a tool like Postman, curl, or HTTP files. The payload must be `multipart/form-data` with a key named `file`.
-
-Example `curl` command:
-```bash
-curl -X POST -F "file=@/path/to/your/image.jpg" https://localhost:7001/api/upload/profile-picture
-```
